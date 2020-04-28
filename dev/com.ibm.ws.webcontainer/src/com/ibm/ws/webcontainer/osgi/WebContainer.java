@@ -18,6 +18,7 @@ import java.util.Iterator;
 import java.util.LinkedHashSet;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.Callable;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
@@ -61,6 +62,7 @@ import com.ibm.ws.javaee.version.ServletVersion;
 import com.ibm.ws.managedobject.ManagedObjectService;
 import com.ibm.ws.runtime.metadata.ModuleMetaData;
 import com.ibm.ws.threading.FutureMonitor;
+import com.ibm.ws.threading.listeners.CompletionListener;
 import com.ibm.ws.webcontainer.SessionRegistry;
 import com.ibm.ws.webcontainer.async.AsyncContextFactory;
 import com.ibm.ws.webcontainer.collaborator.CollaboratorService;
@@ -875,8 +877,9 @@ public class WebContainer extends com.ibm.ws.webcontainer.WebContainer implement
         // Track number of modules starting. Rarely a server can begin shutting down while a module is still starting which
         // can result in an NPE. By counting modules in start, if there are module still starting during server quiesce the
         // webcontainer can hold server start while modules finish starting.
-        modulesStarting++;
-        Future<Boolean> result;
+        int moduleNumber = modulesStarting++;
+        Future<Boolean> result = futureMonitor.createFuture(Boolean.class);
+        boolean isAppInitFutureEnabled = false;
         if (TraceComponent.isAnyTracingEnabled() && tc.isEntryEnabled()) {
             Tr.entry(tc, "startModule: " + webModule.getName() + " " + webModule.getContextRoot() + ", modulesStarting = " + modulesStarting);
         }
@@ -941,7 +944,7 @@ public class WebContainer extends com.ibm.ws.webcontainer.WebContainer implement
                     if (!startWebApplication(dMod)) {
                         throw new StateChangeException("startWebApplication");
                     }
-                } else {
+                } else if (!WCCustomProperties.STOP_APP_STARTUP_ON_LISTENER_EXCEPTION) {
                     backgroundWebAppStartFutures.add(es, new Runnable() {
                         @Override
                         public void run() {
@@ -956,9 +959,53 @@ public class WebContainer extends com.ibm.ws.webcontainer.WebContainer implement
                             }
                         }
                     });
+                } else {
+                    if (TraceComponent.isAnyTracingEnabled() && tc.isDebugEnabled()) {
+                        Tr.debug(tc, "startModule: " + webModule.getName() + ", module =" + moduleNumber);
+                    }
+                    isAppInitFutureEnabled = true;                                                         
+                    result = backgroundWebAppStartFutures.add(es, new Callable<Boolean>() {
+
+                        @Override
+                        public Boolean call() throws Exception {
+                            boolean isAppInitSuccess = false;
+                            try {
+                                isAppInitSuccess = startWebApplication(dMod);
+                            } catch (Throwable e) {
+                                FFDCWrapper.processException(e, getClass().getName(), "startModule async callable", new Object[] { webModule, this });
+                                if (TraceComponent.isAnyTracingEnabled() && tc.isEventEnabled()) {
+                                    Tr.event(tc, "startModule async w callable: " + webModule.getName() + "; " + e);
+                                }
+                                stopModule(moduleInfo);
+                            }
+
+                            if (TraceComponent.isAnyTracingEnabled() && tc.isDebugEnabled()) {
+                                Tr.debug(tc, "startModule: success = " + isAppInitSuccess + " for = " + webModule.getName() + ", module =" + moduleNumber);
+                            }
+                            return isAppInitSuccess;
+                        }
+                        
+                    });
+                    
+                    StartAppFuturesListener listener = new StartAppFuturesListener(moduleNumber);
+                    futureMonitor.onCompletion(addContextRootRequirement(dMod), listener);
+                    futureMonitor.onCompletion(result, listener); 
+                    
+                    if (listener.isFailed()) {
+                        if (TraceComponent.isAnyTracingEnabled() && tc.isDebugEnabled()) {
+                            Tr.debug(tc, "startModule: future reported failed for = " + webModule.getName());
+                        }
+                        throw new StateChangeException("startWebApplication");
+                    }
+                    
+                    // grab the Aggregate Future
+                    result = listener.getAggregateResultFuture();
+                    
                 }
                 registerMBeans((WebModuleMetaDataImpl) wmmd, webModuleContainer);
-                result =  addContextRootRequirement(dMod);
+                if (!isAppInitFutureEnabled) {
+                    result =  addContextRootRequirement(dMod);
+                }
             }
         } catch (Throwable e) {
             FFDCWrapper.processException(e, getClass().getName(), "startModule", new Object[] { webModule, this });
@@ -976,6 +1023,52 @@ public class WebContainer extends com.ibm.ws.webcontainer.WebContainer implement
             Tr.exit(tc, "startModule: ", "modulesStarting = " + modulesStarting);
         }
         return result;
+    }
+    
+    
+    /**
+     * Aggregate AppInit_Channel_Futures
+     */
+    private class StartAppFuturesListener implements CompletionListener<Boolean> {
+
+        private Future<Boolean> aggregateResultFuture = null;
+        private int remaining = 2;
+        private volatile boolean aggregateResult = true;
+        private int currentModule = -1;
+
+        StartAppFuturesListener(int currentModule) {
+            this.aggregateResultFuture = futureMonitor.createFuture(Boolean.class);
+            this.currentModule = currentModule;
+        }
+
+        @Override
+        public synchronized void successfulCompletion(Future<Boolean> future, Boolean result) {
+            aggregateResult &= result;
+            if (--remaining == 0) {
+                futureMonitor.setResult(aggregateResultFuture, aggregateResult);
+            }
+        }
+
+        @Override
+        public synchronized void failedCompletion(Future<Boolean> future, Throwable t) {
+            futureMonitor.setResult(aggregateResultFuture, t);
+            aggregateResult = false;
+            if (TraceComponent.isAnyTracingEnabled() && tc.isDebugEnabled()) {
+                Tr.debug(tc, "startAppFuturesListener:, failedCompletion, module = " + currentModule);
+            }
+        }
+
+        public boolean isFailed() {
+            return !aggregateResult;
+        }
+
+        /**
+         * @return the aggregateResultFuture
+         */
+        public Future<Boolean> getAggregateResultFuture() {
+            return aggregateResultFuture;
+        }
+
     }
 
     /**

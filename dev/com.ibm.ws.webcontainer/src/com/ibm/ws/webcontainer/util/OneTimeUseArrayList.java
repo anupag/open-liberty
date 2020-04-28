@@ -13,6 +13,7 @@ package com.ibm.ws.webcontainer.util;
 import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.ListIterator;
+import java.util.concurrent.Callable;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Future;
 
@@ -34,6 +35,15 @@ public class OneTimeUseArrayList {
             return runnables.add(es.submit(r));
         }
         return false;
+    }
+    
+    public synchronized Future<Boolean> add(ExecutorService es, Callable<Boolean> c) {
+        Future<Boolean> futureTask = null;
+        if (enabled) {
+            futureTask = es.submit(c);            
+            runnables.add(futureTask);
+        }
+        return futureTask;
     }
 
     public synchronized Iterator<Future<?>> iterator() {
